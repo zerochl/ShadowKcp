@@ -361,10 +361,10 @@ func StartShadowSocks() {
 
 	flag.BoolVar(&printVer, "version", false, "print version")
 	flag.StringVar(&configFile, "c", "config.json", "specify config file")
-	flag.StringVar(&cmdServer, "s", "104.224.174.229", "server address")
+	flag.StringVar(&cmdServer, "s", "127.0.0.1", "server address")
 	flag.StringVar(&cmdLocal, "b", "", "local address, listen only to this address if specified")
 	flag.StringVar(&cmdConfig.Password, "k", "ODA5MzVjYj", "password")
-	flag.IntVar(&cmdConfig.ServerPort, "p", 434, "server port")
+	flag.IntVar(&cmdConfig.ServerPort, "p", 12948, "server port")
 	flag.IntVar(&cmdConfig.Timeout, "t", 300, "timeout in seconds")
 	flag.IntVar(&cmdConfig.LocalPort, "l", 1080, "local socks5 proxy port")
 	flag.StringVar(&cmdConfig.Method, "m", "chacha20", "encryption method, default: aes-256-cfb")
