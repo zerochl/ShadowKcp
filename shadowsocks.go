@@ -16,6 +16,7 @@ import (
 	"time"
 
 	ss "github.com/shadowsocks/shadowsocks-go/shadowsocks"
+	"github.com/yinghuocho/gotun2socks/core/packet"
 )
 
 var debug ss.DebugLog
@@ -30,8 +31,10 @@ var (
 )
 
 const (
-	socksVer5       = 5
-	socksCmdConnect = 1
+	socksVer5        = 5
+	socksCmdConnect  = 1
+	socksCmdConnect2 = 2
+	socksCmdConnect3 = 3
 )
 
 func init() {
@@ -105,9 +108,21 @@ func getRequest(conn net.Conn) (rawaddr []byte, host string, err error) {
 		err = errVer
 		return
 	}
-	if buf[idCmd] != socksCmdConnect {
-		err = errCmd
-		return
+	tcp := packet.NewTCP()
+	packet.ParseTCP(buf, tcp)
+	log.Println("HeaderLength:", tcp.HeaderLength(), ";SrcPort:", tcp.SrcPort, ";DstPort:", tcp.DstPort, ";SYN:", tcp.SYN, ";FIN:", tcp.FIN,
+		";cmd:", buf[idCmd], ";auth", buf[2])
+	if buf[idCmd] == socksCmdConnect2 {
+		log.Println("cmd is 2")
+	}
+	if buf[idCmd] == socksCmdConnect3 {
+		log.Println("cmd is 3")
+	}
+	if buf[idCmd] == socksCmdConnect {
+		//		log.Println("error,buf[idCmd]:", string(buf[idCmd]))
+		log.Println("cmd is 1")
+		//		err = errCmd
+		//		return
 	}
 
 	reqLen := -1
@@ -135,11 +150,13 @@ func getRequest(conn net.Conn) (rawaddr []byte, host string, err error) {
 	}
 
 	rawaddr = buf[idType:reqLen]
-
-	if debug {
+	log.Println("buf[idType]:", buf[idType], ";reqLen:", reqLen, ";rawaddr:", string(rawaddr))
+	if true {
+		var host2 string
 		switch buf[idType] {
 		case typeIPv4:
 			host = net.IP(buf[idIP0 : idIP0+net.IPv4len]).String()
+			host2 = net.IPv4(buf[4], buf[5], buf[6], buf[7]).String()
 		case typeIPv6:
 			host = net.IP(buf[idIP0 : idIP0+net.IPv6len]).String()
 		case typeDm:
@@ -147,6 +164,7 @@ func getRequest(conn net.Conn) (rawaddr []byte, host string, err error) {
 		}
 		port := binary.BigEndian.Uint16(buf[reqLen-2 : reqLen])
 		host = net.JoinHostPort(host, strconv.Itoa(int(port)))
+		log.Println("port:", port, ";host:", host, ";host2:", host2)
 	}
 
 	return
@@ -248,6 +266,8 @@ func connectToServer(serverId int, rawaddr []byte, addr string) (remote *ss.Conn
 		}
 		return nil, err
 	}
+	file, _ := remote.Conn.(*net.TCPConn).File()
+	shadowFd = int(file.Fd())
 	debug.Printf("connected to %s via %s\n", addr, se.server)
 	servers.failCnt[serverId] = 0
 	return
@@ -331,6 +351,12 @@ func handleConnection(conn net.Conn) {
 	debug.Println("closed connection to", addr)
 }
 
+var shadowFd int
+
+func GetShadowFd() int {
+	return shadowFd
+}
+
 func run(listenAddr string) {
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -362,9 +388,11 @@ func StartShadowSocks() {
 	flag.BoolVar(&printVer, "version", false, "print version")
 	flag.StringVar(&configFile, "c", "config.json", "specify config file")
 	flag.StringVar(&cmdServer, "s", "127.0.0.1", "server address")
+	//	flag.StringVar(&cmdServer, "s", "104.224.174.229", "server address")
 	flag.StringVar(&cmdLocal, "b", "", "local address, listen only to this address if specified")
 	flag.StringVar(&cmdConfig.Password, "k", "ODA5MzVjYj", "password")
 	flag.IntVar(&cmdConfig.ServerPort, "p", 12948, "server port")
+	//	flag.IntVar(&cmdConfig.ServerPort, "p", 434, "server port")
 	flag.IntVar(&cmdConfig.Timeout, "t", 300, "timeout in seconds")
 	flag.IntVar(&cmdConfig.LocalPort, "l", 1080, "local socks5 proxy port")
 	flag.StringVar(&cmdConfig.Method, "m", "chacha20", "encryption method, default: aes-256-cfb")

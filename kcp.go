@@ -80,6 +80,17 @@ func checkError(err error) {
 	}
 }
 
+var kcpfd int
+var kcpfd2 int
+
+func GetKcpFd() int {
+	return kcpfd
+}
+
+func GetKcpFD2() int {
+	return kcpfd2
+}
+
 func Start() {
 	rand.Seed(int64(time.Now().Nanosecond()))
 	if VERSION == "SELFBUILD" {
@@ -316,10 +327,11 @@ func Start() {
 		smuxConfig.MaxReceiveBuffer = config.SockBuf
 
 		createConn := func() (*smux.Session, error) {
-			kcpconn, err := kcp.DialWithOptions(config.RemoteAddr, block, config.DataShard, config.ParityShard)
+			kcpconn, err, fd := kcp.DialWithOptions(config.RemoteAddr, block, config.DataShard, config.ParityShard)
 			if err != nil {
 				return nil, errors.Wrap(err, "createConn()")
 			}
+			kcpfd = fd
 			kcpconn.SetStreamMode(true)
 			kcpconn.SetNoDelay(config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
 			kcpconn.SetWindowSize(config.SndWnd, config.RcvWnd)
@@ -397,7 +409,8 @@ func Start() {
 			}
 
 			// do session open
-			p2, err := muxes[idx].session.OpenStream()
+			p2, err, sid := muxes[idx].session.OpenStream()
+			kcpfd2 = sid
 			if err != nil { // mux failure
 				chScavenger <- muxes[idx].session
 				muxes[idx].session = waitConn()
