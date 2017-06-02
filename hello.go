@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	//	"strconv"
 	"zerolib/udp/udplotus"
 
 	"github.com/gamexg/proxyclient"
@@ -26,6 +27,46 @@ func Greetings(name string) string {
 		log.Println("sleep:", i)
 	}
 	return fmt.Sprintf("HelloVeryGood, %s!", name)
+}
+
+func SendMsg(msg string) {
+	//	conn, err := net.DialTimeout("tcp", "127.0.0.1:1090", 1000*1000*1000*30)
+	conn, err := net.Dial("tcp", "127.0.0.1:1090")
+	if err != nil {
+		fmt.Printf("create client err:%s\n", err)
+		return
+	}
+	defer conn.Close()
+	senddata := []byte(msg)
+	_, err = conn.Write(senddata)
+	if err != nil {
+		log.Println("send msg err:", err)
+	}
+}
+
+func SendUdpMsg() {
+	// 创建连接
+	socket, err = net.DialUDP("udp4", nil, &net.UDPAddr{
+		//		IP:   net.IPv4(192, 168, 0, 47),
+		IP:   net.IPv4(104, 224, 174, 229),
+		Port: 1082,
+	})
+	if err != nil {
+		log.Println("udp连接失败!", err)
+		return
+	}
+	//	file, _ := socket.File()
+	//	SendMsg(strconv.Itoa(int(file.Fd())))
+	defer socket.Close()
+	time.Sleep(2 * time.Second)
+	log.Println("udp连接成功!")
+	senddata := []byte("hello udp")
+	_, err = socket.Write(senddata)
+	if err != nil {
+		log.Println("send msg err:", err)
+	}
+	length, _, _ := socket.ReadFromUDP(senddata)
+	log.Println("udp result:", string(senddata[:length]))
 }
 
 var socket *net.UDPConn

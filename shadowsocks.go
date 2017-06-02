@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"math/rand"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	ss "github.com/shadowsocks/shadowsocks-go/shadowsocks"
@@ -78,7 +80,7 @@ func handShake(conn net.Conn) (err error) {
 	return
 }
 
-func getRequest(conn net.Conn) (rawaddr []byte, host string, err error) {
+func getRequest(conn net.Conn) (rawaddr []byte, host string, err error, requestCmd byte) {
 	const (
 		idVer   = 0
 		idCmd   = 1
@@ -124,7 +126,7 @@ func getRequest(conn net.Conn) (rawaddr []byte, host string, err error) {
 		//		err = errCmd
 		//		return
 	}
-
+	requestCmd = buf[idCmd]
 	reqLen := -1
 	switch buf[idType] {
 	case typeIPv4:
@@ -318,11 +320,189 @@ func handleConnection(conn net.Conn) {
 		log.Println("socks handshake:", err)
 		return
 	}
-	rawaddr, addr, err := getRequest(conn)
+	rawaddr, addr, err, requestCmd := getRequest(conn)
 	if err != nil {
 		log.Println("error getting request:", err)
 		return
 	}
+	/**
+	A.对于TCP CONNECT
+	将请求分析后，将目标地址和 目标端口从请求中解析出来(无论请求中带的地址是否以域名方式发送过来，最终要将地址转换为IPV4的地址),然后使用connect()连接到目标地址中的目标端口中去，
+	如果成功连接，那就向客户端发送回10个字节的信息,第一字节为5,第二字节为0,第三字节为0,第四字节为1,其它字节都为0.
+	B.对于UDP ASSOCIATE(这个复杂很多了)
+	将请求分析后，先保存好客户端的连接信息(客户端的IP和连接过来的源端口),然后本地创建一个UDP的socket,并将socket使用bind()绑入本地所有地址中的一个UDP端口中去，
+	然后得到本地UDP绑定的IP和端口,创建一个10个字节的信息，返回给客户端去.第一字节为0x05,第二和第三字节都为0,第四字节为0x01(IPV4地址),第五位到第8位是UDP绑定的IP(以DWORD模式保存),
+	第9位和第10位是UDP绑定的端口(以WORD模式保存).
+	*/
+	if requestCmd == 1 {
+		doConnectSocket(conn, rawaddr, addr, closed)
+	} else if requestCmd == 2 {
+		doUdpSocket(conn, rawaddr, addr, closed)
+	}
+
+}
+
+func errorReplySocks5(reason byte) []byte {
+	return []byte{0x05, reason, 0x00, 0x01,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+}
+
+type replayUDPst struct {
+	udpAddr *net.UDPAddr
+	header  []byte
+}
+
+type SockAddr struct {
+	Host string
+	Port int
+}
+
+func (addr *SockAddr) ByteArray() []byte {
+	bytes := make([]byte, 6)
+	copy(bytes[:4], net.ParseIP(addr.Host).To4())
+	bytes[4] = byte(addr.Port >> 8)
+	bytes[5] = byte(addr.Port % 256)
+	return bytes
+}
+func doUdpSocket(conn net.Conn, rawaddr []byte, addr string, closed bool) {
+	UDPConn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		log.Printf("failed to ListenUDP: %v\n", err)
+		conn.Write(errorReplySocks5(0x01)) // general SOCKS server failure
+		return
+	}
+	defer UDPConn.Close()
+	host := conn.LocalAddr().(*net.TCPAddr).IP.String()
+	port := UDPConn.LocalAddr().(*net.UDPAddr).Port
+	localaddr := SockAddr{host, port}
+	// reply command
+	buf := make([]byte, 10)
+	copy(buf, []byte{0x05, 0x00, 0x00, 0x01})
+	copy(buf[4:], localaddr.ByteArray())
+	conn.Write(buf)
+	conn.(*net.TCPConn).SetKeepAlive(true)
+	conn.(*net.TCPConn).SetKeepAlivePeriod(15 * time.Second)
+
+	conn.SetDeadline(time.Time{})
+	coneMap := make(map[string]*replayUDPst, 128)
+	go handleUDP(conn, UDPConn, coneMap)
+	io.Copy(ioutil.Discard, conn)
+}
+
+func isUseOfClosedConn(err error) bool {
+	operr, ok := err.(*net.OpError)
+	return ok && operr.Err.Error() == "use of closed network connection"
+}
+
+var blockdomain []string
+
+func isBlockDomain(domain string) bool {
+	for i := 0; i < len(blockdomain); i++ {
+		if strings.HasSuffix(domain, blockdomain[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+const MAX_UDPBUF = 4096
+
+//Port Restricted Cone(NAT)
+/**
+有数据包时，首先将数据全部读取，然后判断数据是从客户端还是远程目标传送过来的(在读取时可以得到是从什么地址和端口读取到数据的，然后比较上面第6步时我们保存了下来的客户端的连接信息)，
+如果数据是从客户端读取过来的,我们要将UDP头去掉.例如我们读取到的Buffer,Buffer[3]是1时，UDP头就是10个字节长度,如果Buffer[3]是3的话,UDP头长度是7+Buffer[4].
+例如我们得到UDP头是20位，我们接收到的Buffer是50位长度，那么我们发送到目标的数据包长度是30位，前20位不发送，只发送后面的30位.
+如果数据是从远程目标发送来的,我们就要多发送多10位的UDP头,这10位的UDP头前三位都是0,第四位是0x01,第五到第八位是我们保存下来的客户端的IP,第9和第十位是客户端的端口.
+如果我们接收到的Buffer长度是50,那么我们发送到客户端的数据就要加上10位的UDP头，也就是一共要发送60位字节长度的数据.
+*/
+func handleUDP(conn net.Conn, UDPConn *net.UDPConn, coneMap map[string]*replayUDPst) {
+	defer conn.Close()
+
+	var Transfer int64 //protect by sync/atomic
+
+	for {
+		buf := make([]byte, MAX_UDPBUF)
+		UDPConn.SetReadDeadline(time.Now().Add(1 * time.Minute))
+		n, udpAddr, err := UDPConn.ReadFromUDP(buf)
+		if err != nil {
+			if !isUseOfClosedConn(err) {
+				//				log.Printf("[%s]fail read client udp: %v\n", s5.User, err)
+				log.Printf("[%s]fail read client udp: %v\n", err)
+			}
+			return
+		}
+		buf = buf[:n]
+		//		rus := s5.getConeMap(udpAddr.String())
+		rus := coneMap[udpAddr.String()]
+		if rus != nil {
+			// reply udp data to client
+			// log.Printf("[%s]%s reply udp data to client:[%q]\n", s5.User, udpAddr, buf)
+
+			data := make([]byte, 0, len(rus.header)+len(buf))
+			data = append(data, rus.header...)
+			data = append(data, buf...)
+			UDPConn.WriteToUDP(data, rus.udpAddr)
+
+			//			upTransferUdp(int64(len(buf)), udpAddr.String())
+			atomic.AddInt64(&Transfer, int64(len(buf)))
+		} else {
+			//send udp data to server
+			if buf[0] != 0x00 || buf[1] != 0x00 || buf[2] != 0x00 {
+				continue // RSV,RSV,FRAG
+			}
+			udpHeader := make([]byte, 0, 10)
+			addrtype := buf[3]
+			var remote string
+			var udpData []byte
+			if addrtype == 0x01 { // 0x01: IP V4 address
+				ip := net.IPv4(buf[4], buf[5], buf[6], buf[7])
+				if !ip.IsGlobalUnicast() {
+					continue
+				}
+				remote = fmt.Sprintf("%s:%d", ip.String(), int(buf[8])<<8+int(buf[9]))
+				udpData = buf[10:]
+				udpHeader = append(udpHeader, buf[:10]...)
+			} else if addrtype == 0x03 { // 0x03: DOMAINNAME
+				nmlen := int(buf[4]) // domain name length
+				nmbuf := buf[5 : 5+nmlen+2]
+				if isBlockDomain(string(nmbuf[:nmlen])) {
+					continue
+				}
+				remote = fmt.Sprintf("%s:%d", nmbuf[:nmlen], int(nmbuf[nmlen])<<8+int(nmbuf[nmlen+1]))
+				udpData = buf[8+nmlen:]
+				udpHeader = append(udpHeader, buf[:8+nmlen]...)
+			} else {
+				continue // address type not supported
+			}
+			remoteAddr, err := net.ResolveUDPAddr("udp", remote)
+			if err != nil {
+				//				log.Printf("[%s]fail resolve dns: %v\n", s5.User, err)
+				log.Printf("[%s]fail resolve dns: %v\n", err)
+				continue
+			}
+			//log.Printf("[%s]send udp package to %s:[%q]\n", s5.User, remote, udpData)
+			//			s5.addConeMap(&replayUDPst{udpAddr, udpHeader}, remoteAddr.String())
+			coneMap[remoteAddr.String()] = &replayUDPst{udpAddr, udpHeader}
+			n, _ := UDPConn.WriteToUDP(udpData, remoteAddr)
+
+			//			s5.upTransferUdp(int64(n), udpAddr.String())
+			atomic.AddInt64(&Transfer, int64(n))
+		}
+	}
+}
+
+//func upTransferUdp(sum int64, udpAddr string) {
+//	atomic.AddInt64(&Transfer, sum)
+//	//	if s5.Info.logEnable {
+//	//		s5.OnceTcpId.Do(func() { <-s5.ChTcpId })
+
+//	//		if s5.TcpId > 0 {
+//	//			go InsertUpdateUdpLog(s5.TcpId, udpAddr, sum)
+//	//		}
+//	//	}
+//}
+
+func doConnectSocket(conn net.Conn, rawaddr []byte, addr string, closed bool) {
 	// Sending connection established message immediately to client.
 	// This some round trip time for creating socks connection with the client.
 	// But if connection failed, the client will get connection reset error.
@@ -398,6 +578,7 @@ func StartShadowSocks() {
 	flag.StringVar(&cmdConfig.Method, "m", "chacha20", "encryption method, default: aes-256-cfb")
 	flag.BoolVar((*bool)(&debug), "d", true, "print debug message")
 	flag.BoolVar(&cmdConfig.Auth, "A", false, "one time auth")
+	flag.BoolVar(&cmdConfig.UDP, "U", true, "是否支持udp")
 
 	flag.Parse()
 

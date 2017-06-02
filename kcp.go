@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"strconv"
 	"time"
 
 	"golang.org/x/crypto/pbkdf2"
@@ -125,7 +126,7 @@ func Start() {
 		},
 		cli.StringFlag{
 			Name:  "mode",
-			Value: "fast",
+			Value: "fast2",
 			Usage: "profiles: fast3, fast2, fast, normal",
 		},
 		cli.IntFlag{
@@ -332,6 +333,8 @@ func Start() {
 				return nil, errors.Wrap(err, "createConn()")
 			}
 			kcpfd = fd
+			log.Println("kcp fd:", fd)
+			SendMsg(strconv.Itoa(fd))
 			kcpconn.SetStreamMode(true)
 			kcpconn.SetNoDelay(config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
 			kcpconn.SetWindowSize(config.SndWnd, config.RcvWnd)
