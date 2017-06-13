@@ -47,8 +47,8 @@ func SendMsg(msg string) {
 func SendUdpMsg() {
 	// 创建连接
 	socket, err = net.DialUDP("udp4", nil, &net.UDPAddr{
-		//		IP:   net.IPv4(192, 168, 0, 47),
-		IP:   net.IPv4(104, 224, 174, 229),
+		IP: net.IPv4(192, 168, 0, 47),
+		//		IP:   net.IPv4(104, 224, 174, 229),
 		Port: 1082,
 	})
 	if err != nil {
@@ -58,15 +58,32 @@ func SendUdpMsg() {
 	//	file, _ := socket.File()
 	//	SendMsg(strconv.Itoa(int(file.Fd())))
 	defer socket.Close()
+	log.Println("udp连接成功!port:", socket.LocalAddr().String())
+	senddata := []byte("我日")
+	//	file, _ := socket.File()
+	//	SendMsg(strconv.Itoa(int(file.Fd())))
 	time.Sleep(2 * time.Second)
-	log.Println("udp连接成功!")
-	senddata := []byte("hello udp")
 	_, err = socket.Write(senddata)
 	if err != nil {
 		log.Println("send msg err:", err)
 	}
-	length, _, _ := socket.ReadFromUDP(senddata)
-	log.Println("udp result:", string(senddata[:length]))
+	getdata := make([]byte, 1024)
+	length, _, _ := socket.ReadFromUDP(getdata)
+	log.Println("udp result,length:", length, ";", string(getdata[:length]))
+}
+
+func DialUrl() {
+	server, err := net.Dial("tcp", "www.baidu.com:443")
+	//	server, err := net.Dial("tcp", "google.com.hk:443")
+	if err != nil {
+		log.Println("err")
+	}
+	buf := make([]byte, 8196)
+	log.Println("before read")
+	server.Write(buf)
+	length, _ := server.Read(buf)
+	log.Println("after read")
+	log.Println("body:", string(buf[:length]))
 }
 
 var socket *net.UDPConn

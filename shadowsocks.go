@@ -17,6 +17,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"bytes"
+
+	gosocks5 "github.com/ginuerzh/gosocks5"
 	ss "github.com/shadowsocks/shadowsocks-go/shadowsocks"
 	"github.com/yinghuocho/gotun2socks/core/packet"
 )
@@ -110,19 +113,24 @@ func getRequest(conn net.Conn) (rawaddr []byte, host string, err error, requestC
 		err = errVer
 		return
 	}
-	tcp := packet.NewTCP()
-	packet.ParseTCP(buf, tcp)
-	log.Println("HeaderLength:", tcp.HeaderLength(), ";SrcPort:", tcp.SrcPort, ";DstPort:", tcp.DstPort, ";SYN:", tcp.SYN, ";FIN:", tcp.FIN,
-		";cmd:", buf[idCmd], ";auth", buf[2])
 	if buf[idCmd] == socksCmdConnect2 {
 		log.Println("cmd is 2")
 	}
 	if buf[idCmd] == socksCmdConnect3 {
 		log.Println("cmd is 3")
+
+		udp := packet.NewUDP()
+		packet.ParseUDP(buf, udp)
+		log.Println(";SrcPort:", udp.SrcPort, ";DstPort:", udp.DstPort, ";cmd:", buf[idCmd], ";auth", buf[2])
 	}
 	if buf[idCmd] == socksCmdConnect {
 		//		log.Println("error,buf[idCmd]:", string(buf[idCmd]))
 		log.Println("cmd is 1")
+
+		tcp := packet.NewTCP()
+		packet.ParseTCP(buf, tcp)
+		log.Println("HeaderLength:", tcp.HeaderLength(), ";SrcPort:", tcp.SrcPort, ";DstPort:", tcp.DstPort, ";SYN:", tcp.SYN, ";FIN:", tcp.FIN,
+			";cmd:", buf[idCmd], ";auth", buf[2])
 		//		err = errCmd
 		//		return
 	}
@@ -259,7 +267,10 @@ func parseServerConfig(config *ss.Config) {
 
 func connectToServer(serverId int, rawaddr []byte, addr string) (remote *ss.Conn, err error) {
 	se := servers.srvCipher[serverId]
+	log.Println("se.server:", se.server, ";rawaddr:", string(rawaddr))
+	log.Println("before connectToServer")
 	remote, err = ss.DialWithRawAddr(rawaddr, se.server, se.cipher.Copy())
+	log.Println("after connectToServer")
 	if err != nil {
 		log.Println("error connecting to shadowsocks server:", err)
 		const maxFailCnt = 30
@@ -268,9 +279,7 @@ func connectToServer(serverId int, rawaddr []byte, addr string) (remote *ss.Conn
 		}
 		return nil, err
 	}
-	file, _ := remote.Conn.(*net.TCPConn).File()
-	shadowFd = int(file.Fd())
-	debug.Printf("connected to %s via %s\n", addr, se.server)
+	//	debug.Printf("connected to %s via %s\n", addr, se.server)
 	servers.failCnt[serverId] = 0
 	return
 }
@@ -336,7 +345,7 @@ func handleConnection(conn net.Conn) {
 	*/
 	if requestCmd == 1 {
 		doConnectSocket(conn, rawaddr, addr, closed)
-	} else if requestCmd == 2 {
+	} else if requestCmd == 3 {
 		doUdpSocket(conn, rawaddr, addr, closed)
 	}
 
@@ -364,17 +373,49 @@ func (addr *SockAddr) ByteArray() []byte {
 	bytes[5] = byte(addr.Port % 256)
 	return bytes
 }
+
+//func relayCheck(remoteIP net.IP) bool {
+//	for _, ip := range GetRelayMapIPS(proxy.Info.relayServer) {
+//		if bytes.Equal(remoteIP, ip) {
+//			return true
+//		}
+//	}
+//	return false
+//}
+
+//func GetRelayMapIPS(relayServer string) []net.IP {
+//	relayMap.l.RLock()
+//	defer relayMap.l.RUnlock()
+
+//	return relayMap.m[relayServer]
+//}
+
 func doUdpSocket(conn net.Conn, rawaddr []byte, addr string, closed bool) {
+	log.Println("start udp socket")
+	//负责读取本地与远程过来的数据，只负责replay远程
 	UDPConn, err := net.ListenUDP("udp", nil)
 	if err != nil {
 		log.Printf("failed to ListenUDP: %v\n", err)
 		conn.Write(errorReplySocks5(0x01)) // general SOCKS server failure
 		return
 	}
+	//只负责replay本地
+	udpConnToClient, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		log.Printf("failed to ListenUDP: %v\n", err)
+		conn.Write(errorReplySocks5(0x01)) // general SOCKS server failure
+		return
+	}
+	ssConn := ss.NewSecurePacketConn(UDPConn, servers.srvCipher[0].cipher.Copy(), true) // force OTA on
 	defer UDPConn.Close()
-	host := conn.LocalAddr().(*net.TCPAddr).IP.String()
+	defer udpConnToClient.Close()
+	// RelayCheck
+	remoteIP := conn.RemoteAddr().(*net.TCPAddr).IP
+	log.Println("remoteIP:", remoteIP)
+	//	host := conn.LocalAddr().(*net.TCPAddr).IP.String()
+	host := remoteIP
 	port := UDPConn.LocalAddr().(*net.UDPAddr).Port
-	localaddr := SockAddr{host, port}
+	localaddr := SockAddr{host.String(), port}
 	// reply command
 	buf := make([]byte, 10)
 	copy(buf, []byte{0x05, 0x00, 0x00, 0x01})
@@ -385,7 +426,12 @@ func doUdpSocket(conn net.Conn, rawaddr []byte, addr string, closed bool) {
 
 	conn.SetDeadline(time.Time{})
 	coneMap := make(map[string]*replayUDPst, 128)
-	go handleUDP(conn, UDPConn, coneMap)
+
+	file, _ := UDPConn.File()
+	SendMsg(strconv.Itoa(int(file.Fd())))
+
+	time.Sleep(2 * time.Second)
+	go handleUDP(conn, UDPConn, ssConn, udpConnToClient, coneMap)
 	io.Copy(ioutil.Discard, conn)
 }
 
@@ -406,6 +452,21 @@ func isBlockDomain(domain string) bool {
 }
 
 const MAX_UDPBUF = 4096
+const (
+	idType  = 0 // address type index
+	idIP0   = 1 // ip addres start index
+	idDmLen = 1 // domain address length index
+	idDm0   = 2 // domain address start index
+
+	typeIPv4 = 1 // type is ipv4 address
+	typeDm   = 3 // type is domain address
+	typeIPv6 = 4 // type is ipv6 address
+
+	lenIPv4     = 1 + net.IPv4len + 2 // 1addrType + ipv4 + 2port
+	lenIPv6     = 1 + net.IPv6len + 2 // 1addrType + ipv6 + 2port
+	lenDmBase   = 1 + 1 + 2           // 1addrType + 1addrLen + 2port, plus addrLen
+	lenHmacSha1 = 10
+)
 
 //Port Restricted Cone(NAT)
 /**
@@ -415,9 +476,9 @@ const MAX_UDPBUF = 4096
 如果数据是从远程目标发送来的,我们就要多发送多10位的UDP头,这10位的UDP头前三位都是0,第四位是0x01,第五到第八位是我们保存下来的客户端的IP,第9和第十位是客户端的端口.
 如果我们接收到的Buffer长度是50,那么我们发送到客户端的数据就要加上10位的UDP头，也就是一共要发送60位字节长度的数据.
 */
-func handleUDP(conn net.Conn, UDPConn *net.UDPConn, coneMap map[string]*replayUDPst) {
+func handleUDP(conn net.Conn, UDPConn *net.UDPConn, ssConn *ss.SecurePacketConn, udpConnToClient *net.UDPConn, coneMap map[string]*replayUDPst) {
 	defer conn.Close()
-
+	log.Println("start handle udp")
 	var Transfer int64 //protect by sync/atomic
 
 	for {
@@ -432,19 +493,58 @@ func handleUDP(conn net.Conn, UDPConn *net.UDPConn, coneMap map[string]*replayUD
 			return
 		}
 		buf = buf[:n]
+		log.Println("receive:", string(buf[:]))
+		log.Println("udpAddr.String():", udpAddr.String())
 		//		rus := s5.getConeMap(udpAddr.String())
 		rus := coneMap[udpAddr.String()]
-		if rus != nil {
+
+		//		cipher := ssConn.Copy()
+		//		iv := make([]byte, ssConn.GetIvLen())
+		//		copy(iv, buf[:ssConn.GetIvLen()])
+		//		if err = cipher.InitDecrypt(iv); err == nil {
+		//		if rus != nil {
+		if udpAddr.IP.String() != "127.0.0.1" {
+			//收到的数据为加密数据
+			//			return
+			//		}
+			//		if rus != nil {
 			// reply udp data to client
 			// log.Printf("[%s]%s reply udp data to client:[%q]\n", s5.User, udpAddr, buf)
+			paraseResult, n := ssConn.ParseReadData(buf)
 
-			data := make([]byte, 0, len(rus.header)+len(buf))
+			reqLen := lenIPv4
+			dstIP := net.IP(paraseResult[idIP0 : idIP0+net.IPv4len])
+			dst := &net.UDPAddr{
+				IP:   dstIP,
+				Port: int(binary.BigEndian.Uint16(paraseResult[reqLen-2 : reqLen])),
+			}
+			//			log.Println("is to client", len(rus.header), ";paraseResult:", len(paraseResult), ";n:", n)
+			log.Println("is to client", ";paraseResult:", len(paraseResult), ";n:", n, ";dstIP:", dstIP.String(), ";port:", dst)
+
+			rus = coneMap[dst.String()]
+			if rus != nil {
+				log.Println("rus is not null,rus.udpAddr:", rus.udpAddr.String())
+			}
+			//			sendToClient := &net.UDPAddr{
+			//				IP:   rus.udpAddr.IP,
+			//				Port: rus.udpAddr.Port,
+			//			}
+			sendData := paraseResult[reqLen:n]
+			log.Println("send to client data:", string(sendData[:]))
+
+			log.Println("is to client", len(rus.header), ";")
+			data := make([]byte, 0, len(rus.header)+len(sendData))
 			data = append(data, rus.header...)
-			data = append(data, buf...)
-			UDPConn.WriteToUDP(data, rus.udpAddr)
-
+			data = append(data, sendData...)
+			//			n, err := UDPConn.WriteToUDP(data, rus.udpAddr)
+			log.Println("写入到本地udp，写入服务地址:", udpConnToClient.LocalAddr().String())
+			n, err := udpConnToClient.WriteTo(data, rus.udpAddr)
+			if err != nil {
+				log.Println("发送数据失败：", err.Error())
+			}
+			log.Println("write to client end,n:", n)
 			//			upTransferUdp(int64(len(buf)), udpAddr.String())
-			atomic.AddInt64(&Transfer, int64(len(buf)))
+			atomic.AddInt64(&Transfer, int64(n))
 		} else {
 			//send udp data to server
 			if buf[0] != 0x00 || buf[1] != 0x00 || buf[2] != 0x00 {
@@ -474,7 +574,18 @@ func handleUDP(conn net.Conn, UDPConn *net.UDPConn, coneMap map[string]*replayUD
 			} else {
 				continue // address type not supported
 			}
+			log.Println("udp remoteIP:", remote, ";proxy address:", servers.srvCipher[0].server)
+			//			remote = "127.0.0.1:12948"
+			//			remote = "192.168.0.47:434"
 			remoteAddr, err := net.ResolveUDPAddr("udp", remote)
+			if err != nil {
+				//				log.Printf("[%s]fail resolve dns: %v\n", s5.User, err)
+				log.Printf("[%s]fail resolve dns: %v\n", err)
+				continue
+			}
+			log.Println("走kcp：", servers.srvCipher[0].server)
+			//			dstAddr, err := net.ResolveUDPAddr("udp", servers.srvCipher[0].server)
+			dstAddr, err := net.ResolveUDPAddr("udp", "192.168.0.47:434") //此处暂时未走kcp
 			if err != nil {
 				//				log.Printf("[%s]fail resolve dns: %v\n", s5.User, err)
 				log.Printf("[%s]fail resolve dns: %v\n", err)
@@ -482,12 +593,34 @@ func handleUDP(conn net.Conn, UDPConn *net.UDPConn, coneMap map[string]*replayUD
 			}
 			//log.Printf("[%s]send udp package to %s:[%q]\n", s5.User, remote, udpData)
 			//			s5.addConeMap(&replayUDPst{udpAddr, udpHeader}, remoteAddr.String())
+			//			udpAddr.IP = []byte("10.0.2.2")
 			coneMap[remoteAddr.String()] = &replayUDPst{udpAddr, udpHeader}
-			n, _ := UDPConn.WriteToUDP(udpData, remoteAddr)
+			//			n, _ := UDPConn.WriteToUDP(udpData, remoteAddr)
+			log.Println("before send to server:", string(udpData[:]))
+			dgram := gosocks5.NewUDPDatagram(gosocks5.NewUDPHeader(0, 0, ToSocksAddr(remoteAddr)), udpData)
+			b := bytes.Buffer{}
+			dgram.Write(&b)
+
+			n, _ := ssConn.WriteTo(b.Bytes()[3:], dstAddr)
+			log.Println("after write udp")
 
 			//			s5.upTransferUdp(int64(n), udpAddr.String())
 			atomic.AddInt64(&Transfer, int64(n))
 		}
+	}
+}
+func ToSocksAddr(addr net.Addr) *gosocks5.Addr {
+	host := "0.0.0.0"
+	port := 0
+	if addr != nil {
+		h, p, _ := net.SplitHostPort(addr.String())
+		host = h
+		port, _ = strconv.Atoi(p)
+	}
+	return &gosocks5.Addr{
+		Type: gosocks5.AddrIPv4,
+		Host: host,
+		Port: uint16(port),
 	}
 }
 
@@ -519,6 +652,9 @@ func doConnectSocket(conn net.Conn, rawaddr []byte, addr string, closed bool) {
 		}
 		return
 	}
+	//	file, _ := remote.Conn.(*net.TCPConn).File()
+	//	log.Println("fd:", strconv.Itoa(int(file.Fd())))
+	//	SendMsg(strconv.Itoa(int(file.Fd())))
 	defer func() {
 		if !closed {
 			remote.Close()
@@ -568,7 +704,7 @@ func StartShadowSocks() {
 	flag.BoolVar(&printVer, "version", false, "print version")
 	flag.StringVar(&configFile, "c", "config.json", "specify config file")
 	flag.StringVar(&cmdServer, "s", "127.0.0.1", "server address")
-	//	flag.StringVar(&cmdServer, "s", "104.224.174.229", "server address")
+	//	flag.StringVar(&cmdServer, "s", "192.168.0.47", "server address")
 	flag.StringVar(&cmdLocal, "b", "", "local address, listen only to this address if specified")
 	flag.StringVar(&cmdConfig.Password, "k", "ODA5MzVjYj", "password")
 	flag.IntVar(&cmdConfig.ServerPort, "p", 12948, "server port")

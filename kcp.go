@@ -14,6 +14,7 @@ import (
 
 	"github.com/klauspost/compress/snappy"
 	"github.com/pkg/errors"
+	//	ss "github.com/shadowsocks/shadowsocks-go/shadowsocks"
 	"github.com/urfave/cli"
 	kcp "github.com/xtaci/kcp-go"
 	"github.com/xtaci/smux"
@@ -110,7 +111,7 @@ func Start() {
 		},
 		cli.StringFlag{
 			Name:  "remoteaddr, r",
-			Value: "104.224.174.229:38600",
+			Value: "192.168.0.47:38600",
 			Usage: "kcp server address",
 		},
 		cli.StringFlag{
@@ -392,6 +393,47 @@ func Start() {
 		chScavenger := make(chan *smux.Session, 128)
 		go scavenger(chScavenger)
 		rr := uint16(0)
+		//		go func() {
+		//			addr, err := net.ResolveUDPAddr("udp", config.LocalAddr)
+		//			checkError(err)
+		//			p1, err := net.ListenUDP("udp", addr)
+		//			checkError(err)
+		//			buf := ss.GetNormalLeakyBuf().Get()
+		//			for {
+		//				if err := p1.SetReadBuffer(config.SockBuf); err != nil {
+		//					log.Println("udp SetReadBuffer:", err)
+		//				}
+		//				if err := p1.SetWriteBuffer(config.SockBuf); err != nil {
+		//					log.Println("udp SetWriteBuffer:", err)
+		//				}
+		//				checkError(err)
+		//				idx := rr % numconn
+
+		//			OPEN_P2:
+		//				// do auto expiration
+		//				if config.AutoExpire > 0 && time.Now().After(muxes[idx].ttl) {
+		//					chScavenger <- muxes[idx].session
+		//					muxes[idx].session = waitConn()
+		//					muxes[idx].ttl = time.Now().Add(time.Duration(config.AutoExpire) * time.Second)
+		//				}
+
+		//				// do session open
+		//				p2, err, sid := muxes[idx].session.OpenStream()
+		//				kcpfd2 = sid
+		//				if err != nil { // mux failure
+		//					chScavenger <- muxes[idx].session
+		//					muxes[idx].session = waitConn()
+		//					muxes[idx].ttl = time.Now().Add(time.Duration(config.AutoExpire) * time.Second)
+		//					goto OPEN_P2
+		//				}
+		//				//				go handleClient(p1, p2)
+		//				n, addr, err := p1.ReadFromUDP(buf[0:])
+
+		//				checkError(err)
+
+		//				rr++
+		//			}
+		//		}()
 		for {
 			p1, err := listener.AcceptTCP()
 			if err := p1.SetReadBuffer(config.SockBuf); err != nil {
@@ -426,6 +468,43 @@ func Start() {
 	}
 	myApp.Run(os.Args)
 }
+
+//func udpListener(config Config, rr, numconn uint16) {
+//	addr, err := net.ResolveUDPAddr("udp", config.LocalAddr)
+//	checkError(err)
+//	p1, err := net.ListenUDP("udp", addr)
+//	checkError(err)
+//	for {
+//		if err := p1.SetReadBuffer(config.SockBuf); err != nil {
+//			log.Println("udp SetReadBuffer:", err)
+//		}
+//		if err := p1.SetWriteBuffer(config.SockBuf); err != nil {
+//			log.Println("udp SetWriteBuffer:", err)
+//		}
+//		checkError(err)
+//		idx := rr % numconn
+
+//	OPEN_P2:
+//		// do auto expiration
+//		if config.AutoExpire > 0 && time.Now().After(muxes[idx].ttl) {
+//			chScavenger <- muxes[idx].session
+//			muxes[idx].session = waitConn()
+//			muxes[idx].ttl = time.Now().Add(time.Duration(config.AutoExpire) * time.Second)
+//		}
+
+//		// do session open
+//		p2, err, sid := muxes[idx].session.OpenStream()
+//		kcpfd2 = sid
+//		if err != nil { // mux failure
+//			chScavenger <- muxes[idx].session
+//			muxes[idx].session = waitConn()
+//			muxes[idx].ttl = time.Now().Add(time.Duration(config.AutoExpire) * time.Second)
+//			goto OPEN_P2
+//		}
+//		go handleClient(p1, p2)
+//		rr++
+//	}
+//}
 
 type scavengeSession struct {
 	session *smux.Session
